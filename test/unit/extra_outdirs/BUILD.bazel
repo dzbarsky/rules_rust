@@ -1,0 +1,33 @@
+load("//rust:defs.bzl", "rust_library", "rust_proc_macro")
+load(":extra_outdirs_test.bzl", "extra_outdirs_test_suite")
+
+rust_proc_macro(
+    name = "write_outdirs_macro",
+    srcs = ["proc_macro.rs"],
+    edition = "2018",
+    visibility = ["//test:__subpackages__"],
+)
+
+rust_library(
+    name = "lib",
+    srcs = ["lib.rs"],
+    edition = "2018",
+)
+
+rust_library(
+    name = "lib_with_outdirs",
+    srcs = ["lib_with_outdirs.rs"],
+    edition = "2018",
+    extra_outdirs = [
+        "test_dir",
+        "another_dir",
+    ],
+    proc_macro_deps = [":write_outdirs_macro"],
+    rustc_env = {
+        "EXTRA_OUTDIRS": "test_dir,another_dir",
+    },
+)
+
+extra_outdirs_test_suite(
+    name = "extra_outdirs_test_suite",
+)
