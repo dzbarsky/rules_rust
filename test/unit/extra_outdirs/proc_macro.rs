@@ -33,4 +33,3 @@ pub fn write_to_outdirs(_item: TokenStream) -> TokenStream {
     }
     TokenStream::new()
 }
-
