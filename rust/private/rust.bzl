@@ -735,6 +735,7 @@ _common_attrs = {
     "extra_outdirs": attr.string_list(
         doc = dedent("""\
             List of additional output directories which are expected to be written by the compiler.
+            The paths are always relative to the output directory of the current Bazel package.
         """),
     ),
     "lint_config": attr.label(
