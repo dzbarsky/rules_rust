@@ -1,7 +1,8 @@
-load("//rust:defs.bzl", "rust_library", "rust_proc_macro")
-load(":extra_outdirs_test.bzl", "extra_outdirs_test_suite")
 load("@bazel_skylib//rules:select_file.bzl", "select_file")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//rust:defs.bzl", "rust_library", "rust_proc_macro")
+load(":extra_outdirs_test.bzl", "extra_outdirs_test_suite")
+
 rust_proc_macro(
     name = "write_outdirs_macro",
     srcs = ["proc_macro.rs"],
@@ -42,12 +43,12 @@ select_file(
 
 sh_test(
     name = "outdirs_content_test",
-    data = [
-        ":lib_with_outdirs_select_file",
-    ],
     srcs = ["outdirs_content_test.sh"],
     args = [
         "$(rlocationpath :lib_with_outdirs_select_file)",
+    ],
+    data = [
+        ":lib_with_outdirs_select_file",
     ],
     deps = ["@rules_shell//shell/runfiles"],
 )
