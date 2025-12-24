@@ -19,7 +19,7 @@ def _extra_outdirs_present_test(ctx):
     found_dirs = []
 
     for output in outputs:
-        # Check if this output is a directory (directories don't have extensions)
+        # Check if this output is a directory
         # and if its basename matches one of our expected directories
         if output.is_directory:
             if output.basename in expected_dirs:
