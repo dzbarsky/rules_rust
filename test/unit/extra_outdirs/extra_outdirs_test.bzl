@@ -15,7 +15,7 @@ def _extra_outdirs_present_test(ctx):
     outputs = rustc_action.outputs.to_list()
 
     # Check that the expected directories are in the outputs
-    expected_dirs = ctx.attr.expected_outdirs
+    expected_dirs = sorted(ctx.attr.expected_outdirs)
     found_dirs = []
 
     for output in outputs:
@@ -25,11 +25,14 @@ def _extra_outdirs_present_test(ctx):
             if output.basename in expected_dirs:
                 found_dirs.append(output.basename)
 
+    # Sort found directories for consistent comparison
+    found_dirs = sorted(found_dirs)
+
     # Verify all expected directories were found
     asserts.equals(
         env,
-        sorted(found_dirs),
-        sorted(expected_dirs),
+        found_dirs,
+        expected_dirs,
         "Expected to find directories {expected} in action outputs, but found {found}".format(
             expected = expected_dirs,
             found = found_dirs,
