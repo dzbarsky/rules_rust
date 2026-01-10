@@ -1486,6 +1486,7 @@ def rustc_compile_action(
     if hasattr(ctx.attr, "extra_outdirs"):
         extra_outdirs_outputs = [ctx.actions.declare_directory(outdir) for outdir in ctx.attr.extra_outdirs]
         outputs.extend(extra_outdirs_outputs)
+
         # Pass the output directory paths to proc macros via environment variables
         # Format: EXTRA_OUTDIRS_PATHS=dir1:path1,dir2:path2
         extra_outdirs_paths = []
