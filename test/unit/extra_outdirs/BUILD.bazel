@@ -16,6 +16,11 @@ rust_library(
     edition = "2018",
 )
 
+not_windows = select({
+    "@platforms//os:windows": ["@platforms//:incompatible"],
+    "//conditions:default": [],
+})
+
 rust_library(
     name = "lib_with_outdirs",
     srcs = ["lib_with_outdirs.rs"],
@@ -25,6 +30,8 @@ rust_library(
         "another_dir",
     ],
     proc_macro_deps = [":write_outdirs_macro"],
+    #   = help: message: Failed to write marker file to C:\b\3vh76b43\execroot\_main\bazel-out\x64_windows-fastbuild\bin\test\unit\extra_outdirs\test_dir\marker.txt: Os { code: 5, kind: PermissionDenied, message: "Access is denied." }
+    target_compatible_with = not_windows,
 )
 
 extra_outdirs_test_suite(
