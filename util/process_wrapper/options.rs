@@ -255,7 +255,57 @@ fn prepare_arg(mut arg: String, subst_mappings: &[(String, String)]) -> String {
         let from = format!("${{{f}}}");
         arg = arg.replace(&from, replace_with);
     }
+    // On Windows, canonicalize() produces \\?\ verbatim paths where forward
+    // slashes are literal, not separators.  After substituting ${pwd} (which
+    // comes from current_dir and may be verbatim), any remaining `/` would
+    // break path resolution.
+    #[cfg(windows)]
+    if arg.contains(r"\\?\") {
+        arg = arg.replace('/', r"\");
+    }
     arg
+}
+
+/// On Windows, resolve `.rs` source file paths that pass through junctions
+/// containing relative symlinks.  Windows cannot resolve chained reparse
+/// points (junction -> relative symlink -> target) in a single traversal,
+/// causing rustc to fail with ERROR_PATH_NOT_FOUND.
+///
+/// Only resolves paths ending in `.rs` to avoid changing crate identity
+/// for `--extern` and `-L` paths (which would cause SVH mismatches).
+#[cfg(windows)]
+fn resolve_external_path(arg: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    use std::path::Path;
+    if !arg.ends_with(".rs") {
+        return Cow::Borrowed(arg);
+    }
+    if !arg.starts_with("external/") && !arg.starts_with("external\\") {
+        return Cow::Borrowed(arg);
+    }
+    let path = Path::new(arg);
+    let mut components = path.components();
+    let Some(_external) = components.next() else {
+        return Cow::Borrowed(arg);
+    };
+    let Some(repo_name) = components.next() else {
+        return Cow::Borrowed(arg);
+    };
+    let junction = Path::new("external").join(repo_name);
+    let Ok(resolved) = std::fs::read_link(&junction) else {
+        return Cow::Borrowed(arg);
+    };
+    let remainder: std::path::PathBuf = components.collect();
+    if remainder.as_os_str().is_empty() {
+        return Cow::Borrowed(arg);
+    }
+    Cow::Owned(resolved.join(remainder).to_string_lossy().into_owned())
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn resolve_external_path(arg: &str) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(arg)
 }
 
 /// Apply substitutions to the given param file. Returns true iff any allow-features flags were found.
@@ -327,8 +377,9 @@ fn prepare_args(
                 )),
             };
             let mut write_to_file = |s: &str| -> Result<(), OptionError> {
+                let s = resolve_external_path(s);
                 match out {
-                    Writer::Function(ref mut f) => f(&expanded_file, s),
+                    Writer::Function(ref mut f) => f(&expanded_file, &s),
                     Writer::BufWriter(ref mut bw) => writeln!(bw, "{s}").map_err(format_err),
                 }
             };
@@ -345,7 +396,11 @@ fn prepare_args(
             processed_args.push(file);
         } else {
             allowed_features |= is_allow_features_flag(&arg);
-            processed_args.push(arg);
+            let resolved = resolve_external_path(&arg);
+            processed_args.push(match resolved {
+                std::borrow::Cow::Borrowed(_) => arg,
+                std::borrow::Cow::Owned(s) => s,
+            });
         }
     }
     if !allowed_features && require_explicit_unstable_features {

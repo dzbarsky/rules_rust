@@ -254,6 +254,68 @@ fn consolidate_dependency_search_paths(
     Ok((args.to_vec(), None))
 }
 
+/// On Windows, convert the path to its 8.3 short form using `GetShortPathNameW`.
+/// Returns the original string unchanged if the conversion fails (e.g. 8.3 names
+/// are disabled on the volume, or the path does not yet exist).
+#[cfg(windows)]
+fn to_short_path(path_str: &str) -> String {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    extern "system" {
+        fn GetShortPathNameW(
+            lpszLongPath: *const u16,
+            lpszShortPath: *mut u16,
+            cchBuffer: u32,
+        ) -> u32;
+    }
+
+    let wide: Vec<u16> = OsStr::new(path_str)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let needed = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return path_str.to_owned();
+    }
+
+    let mut buf = vec![0u16; needed as usize];
+    let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), needed) };
+    if len == 0 {
+        return path_str.to_owned();
+    }
+
+    std::ffi::OsString::from_wide(&buf[..len as usize])
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// On Windows, convert any `-L<variant>=<path>` argument whose total length
+/// exceeds MAX_PATH (260) to use the 8.3 short form of the path.  This
+/// prevents LINK.EXE from failing with LNK1104 when the linker search path
+/// is too long.
+#[cfg(windows)]
+fn shorten_long_link_search_paths(args: Vec<String>) -> Vec<String> {
+    const MAX_PATH: usize = 260;
+    args.into_iter()
+        .map(|arg| {
+            if arg.len() <= MAX_PATH {
+                return arg;
+            }
+            if let Some(rest) = arg.strip_prefix("-L") {
+                if let Some(eq_pos) = rest.find('=') {
+                    let variant = &rest[..eq_pos];
+                    let path = &rest[eq_pos + 1..];
+                    let short = to_short_path(path);
+                    return format!("-L{}={}", variant, short);
+                }
+            }
+            arg
+        })
+        .collect()
+}
+
 fn json_warning(line: &str) -> JsonValue {
     JsonValue::Object(HashMap::from([
         (
@@ -297,6 +359,8 @@ fn main() -> Result<(), ProcessWrapperError> {
 
     let (child_arguments, dep_dir_cleanup) =
         consolidate_dependency_search_paths(&opts.child_arguments)?;
+    #[cfg(windows)]
+    let child_arguments = shorten_long_link_search_paths(child_arguments);
     let mut temp_dir_guard = TemporaryDirectoryGuard::new(dep_dir_cleanup);
 
     let mut command = Command::new(opts.executable);
