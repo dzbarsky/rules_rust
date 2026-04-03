@@ -1,56 +1,70 @@
 use std::collections::HashMap;
 use std::env;
-use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::exit;
 
-use crate::flags::{FlagParseError, Flags, ParseOutcome};
+use crate::flags::{Flags, ParseOutcome};
 use crate::rustc;
 use crate::util::*;
 
+// Re-export shared parsing helpers through `crate::options`.
+pub(crate) use crate::pw_args::{
+    build_child_environment, is_allow_features_flag, is_pipelining_flag,
+    is_relocated_pw_flag, normalize_args_recursive, parse_pw_args, resolve_external_path,
+    NormalizedRustcMetadata, OptionError, ParamFileReadErrorMode, ParsedPwArgs, RelocatedPwFlags,
+    SubprocessPipeliningMode,
+};
 #[derive(Debug)]
-pub(crate) enum OptionError {
-    FlagError(FlagParseError),
-    Generic(String),
+pub(crate) struct Options {
+    pub(crate) executable: String,
+    pub(crate) child_arguments: Vec<String>,
+    // Standalone-expanded paramfiles to remove after the child exits.
+    pub(crate) temporary_expanded_paramfiles: Vec<PathBuf>,
+    pub(crate) child_environment: HashMap<String, String>,
+    pub(crate) touch_file: Option<String>,
+    pub(crate) copy_output: Option<(String, String)>,
+    pub(crate) stdout_file: Option<String>,
+    pub(crate) stderr_file: Option<String>,
+    // Raw stderr copy before line-by-line rustc processing.
+    pub(crate) output_file: Option<String>,
+    pub(crate) rustc_output_format: Option<rustc::ErrorFormat>,
+    // Worker pipelining mode discovered in paramfile flags.
+    pub(crate) pipelining_mode: Option<SubprocessPipeliningMode>,
+    // Side-effect `.rlib` used by the standalone full-action no-op path.
+    pub(crate) pipelining_rlib_path: Option<String>,
 }
 
-impl fmt::Display for OptionError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::FlagError(e) => write!(f, "error parsing flags: {e}"),
-            Self::Generic(s) => write!(f, "{s}"),
+#[derive(Default)]
+struct TemporaryExpandedParamFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl TemporaryExpandedParamFiles {
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn into_inner(mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.paths)
+    }
+}
+
+impl Drop for TemporaryExpandedParamFiles {
+    fn drop(&mut self) {
+        for path in self.paths.drain(..) {
+            let _ = fs::remove_file(path);
         }
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct Options {
-    // Contains the path to the child executable
-    pub(crate) executable: String,
-    // Contains arguments for the child process fetched from files.
-    pub(crate) child_arguments: Vec<String>,
-    // Contains environment variables for the child process fetched from files.
-    pub(crate) child_environment: HashMap<String, String>,
-    // If set, create the specified file after the child process successfully
-    // terminated its execution.
-    pub(crate) touch_file: Option<String>,
-    // If set to (source, dest) copies the source file to dest.
-    pub(crate) copy_output: Option<(String, String)>,
-    // If set, redirects the child process stdout to this file.
-    pub(crate) stdout_file: Option<String>,
-    // If set, redirects the child process stderr to this file.
-    pub(crate) stderr_file: Option<String>,
-    // If set, also logs all unprocessed output from the rustc output to this file.
-    // Meant to be used to get json output out of rustc for tooling usage.
-    pub(crate) output_file: Option<String>,
-    // This controls the output format of rustc messages.
-    pub(crate) rustc_output_format: Option<rustc::ErrorFormat>,
+pub(crate) fn options() -> Result<Options, OptionError> {
+    options_from_args(env::args().collect())
 }
 
-pub(crate) fn options() -> Result<Options, OptionError> {
-    // Process argument list until -- is encountered.
-    // Everything after is sent to the child process.
+pub(crate) fn options_from_args(raw_args: Vec<String>) -> Result<Options, OptionError> {
+    // Flags stop at `--`; everything after goes to the child.
     let mut subst_mapping_raw = None;
     let mut stable_status_file_raw = None;
     let mut volatile_status_file_raw = None;
@@ -110,10 +124,7 @@ pub(crate) fn options() -> Result<Options, OptionError> {
         &mut require_explicit_unstable_features,
     );
 
-    let mut child_args = match flags
-        .parse(env::args().collect())
-        .map_err(OptionError::FlagError)?
-    {
+    let mut child_args = match flags.parse(raw_args).map_err(OptionError::FlagError)? {
         ParseOutcome::Help(help) => {
             eprintln!("{help}");
             exit(0);
@@ -141,13 +152,6 @@ pub(crate) fn options() -> Result<Options, OptionError> {
             Ok((key.to_owned(), v))
         })
         .collect::<Result<Vec<(String, String)>, OptionError>>()?;
-    let stable_stamp_mappings =
-        stable_status_file_raw.map_or_else(Vec::new, |s| read_stamp_status_to_array(s).unwrap());
-    let volatile_stamp_mappings =
-        volatile_status_file_raw.map_or_else(Vec::new, |s| read_stamp_status_to_array(s).unwrap());
-    let environment_file_block = env_from_files(env_file_raw.unwrap_or_default())?;
-    let mut file_arguments = args_from_file(arg_file_raw.unwrap_or_default())?;
-    // Process --copy-output
     let copy_output = copy_output_raw
         .map(|co| {
             if co.len() != 2 {
@@ -167,6 +171,37 @@ pub(crate) fn options() -> Result<Options, OptionError> {
         })
         .transpose()?;
 
+    let require_explicit_unstable_features =
+        require_explicit_unstable_features.is_some_and(|s| s == "true");
+
+    let mut file_arguments = args_from_file(arg_file_raw.unwrap_or_default())?;
+    child_args.append(&mut file_arguments);
+    let mut temporary_expanded_paramfiles = TemporaryExpandedParamFiles::default();
+    let (mut child_args, relocated) = prepare_args_internal(
+        child_args,
+        &subst_mappings,
+        require_explicit_unstable_features,
+        None,
+        None,
+        &mut temporary_expanded_paramfiles,
+    )?;
+
+    let mut env_files = env_file_raw.unwrap_or_default();
+    env_files.extend(relocated.env_files);
+    if !relocated.arg_files.is_empty() {
+        for arg in args_from_file(relocated.arg_files)? {
+            let mut arg = arg;
+            crate::util::apply_substitutions(&mut arg, &subst_mappings);
+            child_args.push(arg);
+        }
+    }
+
+    let stable_status_file = relocated.stable_status_file.or(stable_status_file_raw);
+    let volatile_status_file = relocated.volatile_status_file.or(volatile_status_file_raw);
+
+    let output_file = relocated.output_file.or(output_file);
+    let rustc_output_format_raw = relocated.rustc_output_format.or(rustc_output_format_raw);
+
     let rustc_output_format = rustc_output_format_raw
         .map(|v| match v.as_str() {
             "json" => Ok(rustc::ErrorFormat::Json),
@@ -177,28 +212,14 @@ pub(crate) fn options() -> Result<Options, OptionError> {
         })
         .transpose()?;
 
-    // Prepare the environment variables, unifying those read from files with the ones
-    // of the current process.
-    let vars = environment_block(
-        environment_file_block,
-        &stable_stamp_mappings,
-        &volatile_stamp_mappings,
+    let vars = build_child_environment(
+        &env_files,
+        stable_status_file.as_deref(),
+        volatile_status_file.as_deref(),
         &subst_mappings,
-    );
+    )
+    .map_err(OptionError::Generic)?;
 
-    let require_explicit_unstable_features =
-        require_explicit_unstable_features.is_some_and(|s| s == "true");
-
-    // Append all the arguments fetched from files to those provided via command line.
-    child_args.append(&mut file_arguments);
-    let child_args = prepare_args(
-        child_args,
-        &subst_mappings,
-        require_explicit_unstable_features,
-        None,
-        None,
-    )?;
-    // Split the executable path from the rest of the arguments.
     let (exec_path, args) = child_args.split_first().ok_or_else(|| {
         OptionError::Generic(
             "at least one argument after -- is required (the child process path)".to_owned(),
@@ -208,6 +229,7 @@ pub(crate) fn options() -> Result<Options, OptionError> {
     Ok(Options {
         executable: exec_path.to_owned(),
         child_arguments: args.to_vec(),
+        temporary_expanded_paramfiles: temporary_expanded_paramfiles.into_inner(),
         child_environment: vars,
         touch_file,
         copy_output,
@@ -215,6 +237,8 @@ pub(crate) fn options() -> Result<Options, OptionError> {
         stderr_file,
         output_file,
         rustc_output_format,
+        pipelining_mode: relocated.pipelining_mode,
+        pipelining_rlib_path: relocated.pipelining_rlib_path,
     })
 }
 
@@ -232,81 +256,67 @@ fn args_from_file(paths: Vec<String>) -> Result<Vec<String>, OptionError> {
     Ok(args)
 }
 
-fn env_from_files(paths: Vec<String>) -> Result<HashMap<String, String>, OptionError> {
-    let mut env_vars = HashMap::new();
-    for path in paths.into_iter() {
-        let lines = read_file_to_array(&path).map_err(OptionError::Generic)?;
-        for line in lines.into_iter() {
-            let (k, v) = line
-                .split_once('=')
-                .ok_or_else(|| OptionError::Generic("environment file invalid".to_owned()))?;
-            env_vars.insert(k.to_owned(), v.to_owned());
-        }
-    }
-    Ok(env_vars)
-}
-
-fn is_allow_features_flag(arg: &str) -> bool {
-    arg.starts_with("-Zallow-features=") || arg.starts_with("allow-features=")
-}
-
-fn prepare_arg(mut arg: String, subst_mappings: &[(String, String)]) -> String {
-    for (f, replace_with) in subst_mappings {
-        let from = format!("${{{f}}}");
-        arg = arg.replace(&from, replace_with);
-    }
-    arg
-}
-
-/// Apply substitutions to the given param file. Returns true iff any allow-features flags were found.
+/// Expands one paramfile and returns its allow-features bit plus relocated flags.
 fn prepare_param_file(
     filename: &str,
     subst_mappings: &[(String, String)],
     read_file: &mut impl FnMut(&str) -> Result<Vec<String>, OptionError>,
     write_to_file: &mut impl FnMut(&str) -> Result<(), OptionError>,
-) -> Result<bool, OptionError> {
-    fn process_file(
-        filename: &str,
-        subst_mappings: &[(String, String)],
-        read_file: &mut impl FnMut(&str) -> Result<Vec<String>, OptionError>,
-        write_to_file: &mut impl FnMut(&str) -> Result<(), OptionError>,
-    ) -> Result<bool, OptionError> {
-        let mut has_allow_features_flag = false;
-        for arg in read_file(filename)? {
-            let arg = prepare_arg(arg, subst_mappings);
-            has_allow_features_flag |= is_allow_features_flag(&arg);
-            if let Some(arg_file) = arg.strip_prefix('@') {
-                has_allow_features_flag |=
-                    process_file(arg_file, subst_mappings, read_file, write_to_file)?;
-            } else {
-                write_to_file(&arg)?;
-            }
-        }
-        Ok(has_allow_features_flag)
-    }
-    let has_allow_features_flag = process_file(filename, subst_mappings, read_file, write_to_file)?;
-    Ok(has_allow_features_flag)
+) -> Result<(bool, RelocatedPwFlags), OptionError> {
+    let mut metadata = NormalizedRustcMetadata::default();
+    let mut write_arg = |arg: String| write_to_file(&arg);
+    normalize_args_recursive(
+        read_file(filename)?,
+        subst_mappings,
+        read_file,
+        ParamFileReadErrorMode::Error,
+        &mut write_arg,
+        &mut metadata,
+    )?;
+    Ok((metadata.has_allow_features, metadata.relocated))
 }
 
-/// Apply substitutions to the provided arguments, recursing into param files.
 #[allow(clippy::type_complexity)]
-fn prepare_args(
+fn prepare_args_internal(
     args: Vec<String>,
     subst_mappings: &[(String, String)],
     require_explicit_unstable_features: bool,
     read_file: Option<&mut dyn FnMut(&str) -> Result<Vec<String>, OptionError>>,
     mut write_file: Option<&mut dyn FnMut(&str, &str) -> Result<(), OptionError>>,
-) -> Result<Vec<String>, OptionError> {
+    temporary_expanded_paramfiles: &mut TemporaryExpandedParamFiles,
+) -> Result<(Vec<String>, RelocatedPwFlags), OptionError> {
     let mut allowed_features = false;
     let mut processed_args = Vec::<String>::new();
+    let mut relocated = RelocatedPwFlags::default();
 
     let mut read_file_wrapper = |s: &str| read_file_to_array(s).map_err(OptionError::Generic);
     let mut read_file = read_file.unwrap_or(&mut read_file_wrapper);
 
     for arg in args.into_iter() {
-        let arg = prepare_arg(arg, subst_mappings);
+        let mut arg = arg;
+        crate::util::apply_substitutions(&mut arg, subst_mappings);
         if let Some(param_file) = arg.strip_prefix('@') {
-            let expanded_file = format!("{param_file}.expanded");
+            // Write expanded paramfiles to a temp location the child can always read.
+            let expanded_file = match write_file {
+                Some(_) => format!("{param_file}.expanded"),
+                None => {
+                    let basename = std::path::Path::new(param_file)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("params");
+                    format!(
+                        "{}/pw_expanded_{}_{}",
+                        std::env::temp_dir().display(),
+                        std::process::id(),
+                        basename,
+                    )
+                }
+            };
+
+            enum Writer<'f, F: FnMut(&str, &str) -> Result<(), OptionError>> {
+                Function(&'f mut F),
+                BufWriter(io::BufWriter<File>),
+            }
             let format_err = |err: io::Error| {
                 OptionError::Generic(format!(
                     "{} writing path: {:?}, current directory: {:?}",
@@ -315,153 +325,48 @@ fn prepare_args(
                     std::env::current_dir()
                 ))
             };
-
-            enum Writer<'f, F: FnMut(&str, &str) -> Result<(), OptionError>> {
-                Function(&'f mut F),
-                BufWriter(io::BufWriter<File>),
-            }
             let mut out = match write_file {
                 Some(ref mut f) => Writer::Function(f),
-                None => Writer::BufWriter(io::BufWriter::new(
-                    File::create(&expanded_file).map_err(format_err)?,
-                )),
+                None => {
+                    let file = File::create(&expanded_file).map_err(format_err)?;
+                    temporary_expanded_paramfiles.track(PathBuf::from(&expanded_file));
+                    Writer::BufWriter(io::BufWriter::new(file))
+                }
             };
             let mut write_to_file = |s: &str| -> Result<(), OptionError> {
+                let s = resolve_external_path(s);
                 match out {
-                    Writer::Function(ref mut f) => f(&expanded_file, s),
+                    Writer::Function(ref mut f) => f(&expanded_file, &s),
                     Writer::BufWriter(ref mut bw) => writeln!(bw, "{s}").map_err(format_err),
                 }
             };
 
-            // Note that substitutions may also apply to the param file path!
-            let (file, allowed) = prepare_param_file(
+            // Substitutions also apply to the paramfile path.
+            let (file, (allowed, pf_relocated)) = prepare_param_file(
                 param_file,
                 subst_mappings,
                 &mut read_file,
                 &mut write_to_file,
             )
-            .map(|af| (format!("@{expanded_file}"), af))?;
+            .map(|(af, rel)| (format!("@{expanded_file}"), (af, rel)))?;
             allowed_features |= allowed;
+            relocated.merge_from(pf_relocated);
             processed_args.push(file);
         } else {
             allowed_features |= is_allow_features_flag(&arg);
-            processed_args.push(arg);
+            let resolved = resolve_external_path(&arg);
+            processed_args.push(match resolved {
+                std::borrow::Cow::Borrowed(_) => arg,
+                std::borrow::Cow::Owned(s) => s,
+            });
         }
     }
     if !allowed_features && require_explicit_unstable_features {
         processed_args.push("-Zallow-features=".to_string());
     }
-    Ok(processed_args)
-}
-
-fn environment_block(
-    environment_file_block: HashMap<String, String>,
-    stable_stamp_mappings: &[(String, String)],
-    volatile_stamp_mappings: &[(String, String)],
-    subst_mappings: &[(String, String)],
-) -> HashMap<String, String> {
-    // Taking all environment variables from the current process
-    // and sending them down to the child process
-    let mut environment_variables: HashMap<String, String> = std::env::vars().collect();
-    // Have the last values added take precedence over the first.
-    // This is simpler than needing to track duplicates and explicitly override
-    // them.
-    environment_variables.extend(environment_file_block);
-    for (f, replace_with) in &[stable_stamp_mappings, volatile_stamp_mappings].concat() {
-        for value in environment_variables.values_mut() {
-            let from = format!("{{{f}}}");
-            let new = value.replace(from.as_str(), replace_with);
-            *value = new;
-        }
-    }
-    for (f, replace_with) in subst_mappings {
-        for value in environment_variables.values_mut() {
-            let from = format!("${{{f}}}");
-            let new = value.replace(from.as_str(), replace_with);
-            *value = new;
-        }
-    }
-    environment_variables
+    Ok((processed_args, relocated))
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_enforce_allow_features_flag_user_didnt_say() {
-        let args = vec!["rustc".to_string()];
-        let subst_mappings: Vec<(String, String)> = vec![];
-        let args = prepare_args(args, &subst_mappings, true, None, None).unwrap();
-        assert_eq!(
-            args,
-            vec!["rustc".to_string(), "-Zallow-features=".to_string(),]
-        );
-    }
-
-    #[test]
-    fn test_enforce_allow_features_flag_user_requested_something() {
-        let args = vec![
-            "rustc".to_string(),
-            "-Zallow-features=whitespace_instead_of_curly_braces".to_string(),
-        ];
-        let subst_mappings: Vec<(String, String)> = vec![];
-        let args = prepare_args(args, &subst_mappings, true, None, None).unwrap();
-        assert_eq!(
-            args,
-            vec![
-                "rustc".to_string(),
-                "-Zallow-features=whitespace_instead_of_curly_braces".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_enforce_allow_features_flag_user_requested_something_in_param_file() {
-        let mut written_files = HashMap::<String, String>::new();
-        let mut read_files = HashMap::<String, Vec<String>>::new();
-        read_files.insert(
-            "rustc_params".to_string(),
-            vec!["-Zallow-features=whitespace_instead_of_curly_braces".to_string()],
-        );
-
-        let mut read_file = |filename: &str| -> Result<Vec<String>, OptionError> {
-            read_files
-                .get(filename)
-                .cloned()
-                .ok_or_else(|| OptionError::Generic(format!("file not found: {}", filename)))
-        };
-        let mut write_file = |filename: &str, content: &str| -> Result<(), OptionError> {
-            if let Some(v) = written_files.get_mut(filename) {
-                v.push_str(content);
-            } else {
-                written_files.insert(filename.to_owned(), content.to_owned());
-            }
-            Ok(())
-        };
-
-        let args = vec!["rustc".to_string(), "@rustc_params".to_string()];
-        let subst_mappings: Vec<(String, String)> = vec![];
-
-        let args = prepare_args(
-            args,
-            &subst_mappings,
-            true,
-            Some(&mut read_file),
-            Some(&mut write_file),
-        );
-
-        assert_eq!(
-            args.unwrap(),
-            vec!["rustc".to_string(), "@rustc_params.expanded".to_string(),]
-        );
-
-        assert_eq!(
-            written_files,
-            HashMap::<String, String>::from([(
-                "rustc_params.expanded".to_string(),
-                "-Zallow-features=whitespace_instead_of_curly_braces".to_string()
-            )])
-        );
-    }
-}
+#[path = "test/options.rs"]
+mod test;
