@@ -77,10 +77,12 @@ fn run_buildrs() -> Result<(), String> {
                 .ok_or_else(|| "Failed while getting file name".to_string())?;
             let link = manifest_dir.join(file_name);
 
-            symlink_if_not_exists(&path, &link)
+            let created = symlink_if_not_exists(&path, &link)
                 .map_err(|err| format!("Failed to symlink {path:?} to {link:?}: {err}"))?;
 
-            exec_root_links.push(link)
+            if created {
+                exec_root_links.push(link);
+            }
         }
     }
 
@@ -219,15 +221,25 @@ fn run_buildrs() -> Result<(), String> {
         )
     });
 
-    if !exec_root_links.is_empty() {
-        for link in exec_root_links {
-            remove_symlink(&link).map_err(|e| {
-                format!(
-                    "Failed to remove exec_root link '{}' with {:?}",
+    for link in exec_root_links {
+        if let Err(e) = remove_symlink(&link) {
+            if cfg!(target_family = "windows") {
+                // On Windows, symlink removal can fail with PermissionDenied if
+                // another process still holds a handle to the target directory.
+                // These are temporary symlinks in the build sandbox that Bazel
+                // will clean up, so we log and continue rather than failing.
+                eprintln!(
+                    "Warning: could not remove exec_root link '{}': {:?}",
                     link.display(),
                     e
-                )
-            })?;
+                );
+            } else {
+                return Err(format!(
+                    "Failed to remove exec_root link '{}': {:?}",
+                    link.display(),
+                    e
+                ));
+            }
         }
     }
 
@@ -247,10 +259,13 @@ fn should_symlink_exec_root() -> bool {
 }
 
 /// Create a symlink from `link` to `original` if `link` doesn't already exist.
-fn symlink_if_not_exists(original: &Path, link: &Path) -> Result<(), String> {
-    symlink(original, link)
-        .or_else(swallow_already_exists)
-        .map_err(|err| format!("Failed to create symlink: {err}"))
+/// Returns `true` if a new symlink was created, `false` if the path already existed.
+fn symlink_if_not_exists(original: &Path, link: &Path) -> Result<bool, String> {
+    match symlink(original, link) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(format!("Failed to create symlink: {err}")),
+    }
 }
 
 fn resolve_rundir(rundir: &str, exec_root: &Path, manifest_dir: &Path) -> Result<PathBuf, String> {
@@ -268,14 +283,6 @@ fn resolve_rundir(rundir: &str, exec_root: &Path, manifest_dir: &Path) -> Result
         return Err(format!("rundir must not contain .. but was {:?}", rundir));
     }
     Ok(exec_root.join(rundir_path))
-}
-
-fn swallow_already_exists(err: std::io::Error) -> std::io::Result<()> {
-    if err.kind() == std::io::ErrorKind::AlreadyExists {
-        Ok(())
-    } else {
-        Err(err)
-    }
 }
 
 /// A representation of expected command line arguments.
