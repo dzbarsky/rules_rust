@@ -52,6 +52,7 @@ load(
     "generate_output_diagnostics",
     "get_edition",
     "get_import_macro_deps",
+    "is_exec_configuration",
     "transform_deps",
     "transform_sources",
 )
@@ -65,6 +66,25 @@ def _assert_no_deprecated_attributes(_ctx):
         _ctx (ctx): The current rule's context object
     """
     pass
+
+def _pipelining_output_hash_salt(ctx, toolchain, crate_type, disable_pipelining):
+    """Returns a mode tag for artifact paths that differ across pipelining modes."""
+
+    if is_exec_configuration(ctx) or not can_use_metadata_for_pipelining(toolchain, crate_type):
+        return ""
+
+    if toolchain._worker_pipelining:
+        return "worker_pipelining"
+
+    if can_build_metadata(
+        toolchain,
+        ctx,
+        crate_type,
+        disable_pipelining = disable_pipelining,
+    ):
+        return "hollow_rlib"
+
+    return ""
 
 def _rust_library_impl(ctx):
     """The implementation of the `rust_library` rule.
@@ -146,6 +166,11 @@ def _rust_library_common(ctx, crate_type):
         crate_root = crate_root_src(ctx.attr.name, ctx.attr.crate_name, ctx.files.srcs, crate_type)
     srcs, compile_data, crate_root = transform_sources(ctx, ctx.files.srcs, ctx.files.compile_data, crate_root)
 
+    # Worker pipelining uses a single rustc invocation (no SVH mismatch risk),
+    # so disable_pipelining (which works around SVH issues in hollow rlib mode)
+    # should be ignored when worker pipelining is active.
+    effective_disable_pipelining = getattr(ctx.attr, "disable_pipelining", False) and not toolchain._worker_pipelining
+
     # Determine unique hash for this rlib.
     # Note that we don't include a hash for `cdylib` and `staticlib` since they are meant to be consumed externally
     # and having a deterministic name is important since it ends up embedded in the executable. This is problematic
@@ -154,7 +179,16 @@ def _rust_library_common(ctx, crate_type):
     if crate_type in ["cdylib", "staticlib"]:
         output_hash = None
     else:
-        output_hash = determine_output_hash(crate_root, ctx.label)
+        output_hash = determine_output_hash(
+            crate_root,
+            ctx.label,
+            salt = _pipelining_output_hash_salt(
+                ctx,
+                toolchain,
+                crate_type,
+                effective_disable_pipelining,
+            ),
+        )
 
     rust_lib_name = determine_lib_name(
         crate_name,
@@ -166,24 +200,38 @@ def _rust_library_common(ctx, crate_type):
     rust_metadata = None
     rustc_rmeta_output = None
     metadata_supports_pipelining = False
+
     if can_build_metadata(
         toolchain,
         ctx,
         crate_type,
-        disable_pipelining = getattr(ctx.attr, "disable_pipelining", False),
+        disable_pipelining = effective_disable_pipelining,
     ):
-        # The hollow rlib uses .rlib extension (not .rmeta) so rustc reads it as an
-        # rlib archive containing lib.rmeta with optimized MIR. It is placed in a
-        # "_hollow/" subdirectory so the full rlib and hollow rlib never appear in the
-        # same -Ldependency= search directory (which would cause E0463).
-        rust_metadata = ctx.actions.declare_file(
-            "_hollow/" + rust_lib_name[:-len(".rlib")] + "-hollow.rlib",
-        )
+        if can_use_metadata_for_pipelining(toolchain, crate_type) and toolchain._worker_pipelining and not is_exec_configuration(ctx):
+            # Worker pipelining: single rustc invocation emitting both .rmeta and .rlib.
+            # Use a real .rmeta file (not a hollow rlib) so downstream crates can use
+            # --extern name=path.rmeta. No -Zno-codegen, no RUSTC_BOOTSTRAP needed.
+            # The .rmeta is placed in a "_pipeline/" subdirectory so it never coexists
+            # with the .rlib in the same -Ldependency= search directory (which would
+            # cause E0463 if they're from different build runs with different SVHs).
+            # Exec-platform builds always use hollow rlib (with RUSTC_BOOTSTRAP=1)
+            # to maintain consistent SVH across all three pipelining configurations.
+            rust_metadata = ctx.actions.declare_file(
+                "_pipeline/" + rust_lib_name[:-len(".rlib")] + ".rmeta",
+            )
+        else:
+            # The hollow rlib uses .rlib extension (not .rmeta) so rustc reads it as an
+            # rlib archive containing lib.rmeta with optimized MIR. It is placed in a
+            # "_hollow/" subdirectory so the full rlib and hollow rlib never appear in the
+            # same -Ldependency= search directory (which would cause E0463).
+            rust_metadata = ctx.actions.declare_file(
+                "_hollow/" + rust_lib_name[:-len(".rlib")] + "-hollow.rlib",
+            )
         rustc_rmeta_output = generate_output_diagnostics(ctx, rust_metadata)
 
         metadata_supports_pipelining = (
             can_use_metadata_for_pipelining(toolchain, crate_type) and
-            not ctx.attr.disable_pipelining
+            not effective_disable_pipelining
         )
 
     deps = transform_deps(deps)
@@ -589,6 +637,9 @@ RUSTC_ATTRS = {
     "_extra_rustc_flags": attr.label(
         default = Label("//rust/settings:extra_rustc_flags"),
     ),
+    "_incremental": attr.label(
+        default = Label("//rust/settings:experimental_incremental"),
+    ),
     "_is_proc_macro_dep": attr.label(
         default = Label("//rust/private:is_proc_macro_dep"),
     ),
@@ -607,6 +658,9 @@ RUSTC_ATTRS = {
     ),
     "_rustc_output_diagnostics": attr.label(
         default = Label("//rust/settings:rustc_output_diagnostics"),
+    ),
+    "_worker_pipelining": attr.label(
+        default = Label("//rust/settings:experimental_worker_pipelining"),
     ),
 }
 

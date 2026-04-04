@@ -28,9 +28,14 @@ pub(crate) fn read_file_to_array(path: &str) -> Result<Vec<String>, String> {
     read_to_array(file)
 }
 
-pub(crate) fn read_stamp_status_to_array(path: String) -> Result<Vec<(String, String)>, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    stamp_status_to_array(file)
+pub(crate) fn read_stamp_status_with_context(
+    path: &str,
+    label: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let file = File::open(path).map_err(|e| {
+        format!("failed to read {label} '{}': {e}", path)
+    })?;
+    stamp_status_to_array(file).map_err(|e| format!("failed to read {label} '{}': {e}", path))
 }
 
 fn read_to_array(reader: impl Read) -> Result<Vec<String>, String> {
@@ -42,20 +47,17 @@ fn read_to_array(reader: impl Read) -> Result<Vec<String>, String> {
         if line.is_empty() {
             continue;
         }
-        // a \ at the end of a line allows us to escape the new line break,
-        // \\ yields a single \, so \\\ translates to a single \ and a new line
-        // escape
+        // Odd trailing backslashes escape the newline; even counts do not.
         let end_backslash_count = line.chars().rev().take_while(|&c| c == '\\').count();
-        // a 0 or even number of backslashes do not lead to a new line escape
         let escape = end_backslash_count % 2 == 1;
-        //  remove backslashes and add back two for every one
+        // Keep escaped newlines and collapse escaped backslashes.
         let l = line.trim_end_matches('\\');
         escaped_line.push_str(l);
         for _ in 0..end_backslash_count / 2 {
             escaped_line.push('\\');
         }
         if escape {
-            // we add a newline as we expect a line after this
+            // Preserve the logical newline for the next physical line.
             escaped_line.push('\n');
         } else {
             ret.push(escaped_line);
@@ -78,34 +80,85 @@ fn stamp_status_to_array(reader: impl Read) -> Result<Vec<(String, String)>, Str
         .collect()
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
+/// Consolidates `-Ldependency` contents into one directory on Windows.
+///
+/// Returns the number of files linked or copied, skipping missing directories
+/// and duplicate filenames.
+#[cfg(windows)]
+pub(crate) fn consolidate_deps_into(
+    dependency_dirs: &[impl AsRef<std::path::Path>],
+    unified_dir: &std::path::Path,
+) -> usize {
+    use std::collections::HashSet;
 
-    #[test]
-    fn test_read_to_array() {
-        let input = r"some escaped \\\
-string
-with other lines"
-            .to_owned();
-        let expected = vec![
-            r"some escaped \
-string",
-            "with other lines",
-        ];
-        let got = read_to_array(input.as_bytes()).unwrap();
-        assert_eq!(expected, got);
+    let mut seen = HashSet::new();
+    let mut count = 0usize;
+    for dir in dependency_dirs {
+        let entries = match std::fs::read_dir(dir.as_ref()) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!(
+                    "consolidate_deps: skipping {}: {}",
+                    dir.as_ref().display(),
+                    e
+                );
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !(file_type.is_file() || file_type.is_symlink()) {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let file_name_lower = file_name.to_string_lossy().to_ascii_lowercase();
+            if !seen.insert(file_name_lower) {
+                continue;
+            }
+            let dest = unified_dir.join(&file_name);
+            let src = entry.path();
+            match std::fs::hard_link(&src, &dest) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    eprintln!(
+                        "consolidate_deps: hard_link {} -> {} failed ({}), falling back to copy",
+                        src.display(),
+                        dest.display(),
+                        e
+                    );
+                    if let Err(copy_err) = std::fs::copy(&src, &dest) {
+                        eprintln!(
+                            "consolidate_deps: copy {} -> {} also failed: {}",
+                            src.display(),
+                            dest.display(),
+                            copy_err
+                        );
+                    }
+                }
+            }
+            count += 1;
+        }
     }
+    count
+}
 
-    #[test]
-    fn test_stamp_status_to_array() {
-        let lines = "aaa bbb\\\nvvv\nccc ddd\neee fff";
-        let got = stamp_status_to_array(lines.as_bytes()).unwrap();
-        let expected = vec![
-            ("aaa".to_owned(), "bbb\nvvv".to_owned()),
-            ("ccc".to_owned(), "ddd".to_owned()),
-            ("eee".to_owned(), "fff".to_owned()),
-        ];
-        assert_eq!(expected, got);
+/// Applies `${key}` -> `value` substitutions to `s`.
+///
+/// On Windows, also normalizes `/` after verbatim-path substitutions.
+pub(crate) fn apply_substitutions(s: &mut String, subst: &[(String, String)]) {
+    for (k, v) in subst {
+        *s = s.replace(&format!("${{{k}}}"), v);
+    }
+    #[cfg(windows)]
+    if s.contains(r"\\?\") {
+        *s = s.replace('/', r"\");
     }
 }
+
+#[cfg(test)]
+#[path = "test/util.rs"]
+mod test;

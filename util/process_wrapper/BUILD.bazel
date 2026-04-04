@@ -28,12 +28,15 @@ selects.config_setting_group(
 
 rust_binary_without_process_wrapper(
     name = "process_wrapper",
-    srcs = glob(["*.rs"]),
+    srcs = glob([
+        "*.rs",
+        "test/*.rs",
+    ]),
     allocator_libraries = select({
         "@rules_rust//rust/settings:experimental_use_allocator_libraries_with_mangled_symbols_on": "@rules_rust//ffi/rs:allocator_libraries_with_mangling_support_without_process_wrapper",
         "//conditions:default": "@rules_rust//ffi/rs:empty_allocator_libraries",
     }),
-    edition = "2018",
+    edition = "2024",
     # To ensure the process wrapper is produced deterministically
     # debug info, which is known to sometimes have host specific
     # paths embedded in this section, is stripped out.
@@ -51,7 +54,26 @@ rust_binary_without_process_wrapper(
 rust_test_without_process_wrapper_test(
     name = "process_wrapper_test",
     crate = ":process_wrapper",
-    edition = "2018",
+    data = [
+        "//rust/toolchain:current_rust_stdlib_files",
+        "//rust/toolchain:current_rustc_files",
+    ],
+    edition = "2024",
+    env = {
+        # Cache-seeding tests (test_seed_cache_root_for_current_dir,
+        # test_seed_cache_root_from_execroot_ancestor) change process CWD
+        # which races with other tests if run in parallel.
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = [
+        "//rust/runfiles",
+    ],
+    rustc_env = {
+        "RUSTC_RLOCATIONPATH": "$(rlocationpath //rust/toolchain:current_rustc_files)",
+    },
+    deps = [
+        "//rust/runfiles",
+    ],
 )
 
 alias(

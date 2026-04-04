@@ -75,6 +75,16 @@ fn run_buildrs() -> Result<(), String> {
             let file_name = path
                 .file_name()
                 .ok_or_else(|| "Failed while getting file name".to_string())?;
+
+            // Skip worker infrastructure directories — these are internal to
+            // rules_rust or Bazel and should never appear in CARGO_MANIFEST_DIR.
+            let name = file_name.to_string_lossy();
+            if name.starts_with("local-spawn-runner.")
+                || name.starts_with("_pw_state")
+            {
+                continue;
+            }
+
             let link = manifest_dir.join(file_name);
 
             symlink_if_not_exists(&path, &link)
